@@ -29,6 +29,9 @@
  *     after: { status: 'Filed' },
  *     metadata: { reason: 'inspection_complete' },
  *   });
+ *
+ * For test scaffolding (records that should be filterable for cleanup):
+ *   await audit(base44, { ...params, is_test: true });
  */
 
 export interface AuditParams {
@@ -48,6 +51,8 @@ export interface AuditParams {
   metadata?: Record<string, any>;
   /** ISO 8601 UTC timestamp. Defaults to now() if omitted. */
   occurred_at?: string;
+  /** Mark this audit entry as test-scaffolding for downstream filtering. Defaults to false. */
+  is_test?: boolean;
 }
 
 export interface AuditResult {
@@ -110,6 +115,10 @@ function safeStringify(value: any): string {
 /**
  * Upload a JSON string to Base44 CDN via Core.UploadFile and return the URL.
  * Used when before/after state exceeds inline size budget.
+ *
+ * NOTE: CDN URLs from this upload are publicly accessible by URL (no auth).
+ * Callers MUST NOT pass full PII state in before/after — see
+ * docs/utility-reference.md audit() entry for the full convention.
  */
 async function uploadJSONToCDN(
   base44: any,
@@ -135,6 +144,10 @@ async function uploadJSONToCDN(
  * lost write. If a previous attempt actually persisted, we'll have a
  * duplicate AuditLog row. Acceptable trade-off: duplicate audit entry is
  * less harmful than missing audit entry.
+ *
+ * Read-back after create may face read replica lag (Phase 1 finding from
+ * Sub-phase C C2.2 probe). The retryDelayMs sleep before re-read addresses
+ * this naturally — 100ms typically sufficient for replica catchup.
  */
 async function createWithVerify(
   base44: any,
@@ -204,6 +217,7 @@ export async function audit(
   if (!params.target_id) throw new Error('audit: target_id is required');
 
   const occurred_at = params.occurred_at ?? new Date().toISOString();
+  const is_test = params.is_test ?? false;
 
   // Compute before/after sizes and decide split-or-externalize
   const beforeJson = safeStringify(params.before ?? null);
@@ -264,6 +278,7 @@ export async function audit(
     after_full_url,
     metadata: params.metadata ?? null,
     occurred_at,
+    is_test,
   };
 
   // Create with verify-write
