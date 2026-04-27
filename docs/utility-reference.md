@@ -27,8 +27,8 @@ When a utility is updated, the new SHA replaces the old in the Blessed SHA field
 |---|---|
 | Repo URL | https://github.com/ClaimsCo/claimsco-utils |
 | Raw URL pattern | `https://raw.githubusercontent.com/ClaimsCo/claimsco-utils/<SHA>/src/<filename>` |
-| Initial README commit SHA | `964414fa5dc863cec3048184741b08b67d3a1f3b` |
 | Visibility | Public (required for unauthenticated Deno URL imports) |
+| Sub-phase A empirical verification | ✅ Passed 2026-04-27 (mergeUpdate, withRetry, idempotencyGuard imported from blessed SHAs into a Base44 function; deploy + runtime tests all passed) |
 
 ---
 
@@ -37,17 +37,21 @@ When a utility is updated, the new SHA replaces the old in the Blessed SHA field
 **Required pattern in every Base44 function import:**
 
 ```typescript
-import { mergeUpdate } from "https://raw.githubusercontent.com/ClaimsCo/claimsco-utils/abc123def4567890abc123def4567890abc12345/src/mergeUpdate.ts";
+import { mergeUpdate } from "https://raw.githubusercontent.com/ClaimsCo/claimsco-utils/368a2e2c5779a04a74cac33c7c09539c918ead97/src/mergeUpdate.ts";
 ```
 
-The 40-character hex string is the immutable commit SHA. This is enforced by `validate-imports.sh` in the main app repo, run pre-deployment.
+The 40-character hex string is the immutable commit SHA. Until/unless the main app codebase migrates to a Git-based deploy pipeline, SHA-pinning compliance is enforced via:
+
+1. App Thread generates SHA-pinned URLs by default in every code emission
+2. Strategy thread reviews each Phase 1+ prompt for SHA-pinning compliance
+3. Code-review discipline as functions ship through Build mode
+
+The originally-planned `validate-imports.sh` pre-deploy hook is deferred until the main app codebase is on Git (likely Phase 2+ acquisition prep).
 
 **Rejected patterns:**
 - Branch refs: `claimsco-utils/main/src/...` ❌ (mutable; today and tomorrow can resolve to different code)
 - Short SHAs: `claimsco-utils/abc123/src/...` ❌ (collision risk; not enforced as immutable by GitHub)
 - Tags: `claimsco-utils/v1.0/src/...` ❌ (we don't tag; rejecting tag refs prevents accidental tag-based imports)
-
-**Why role-based read on `validate-imports.sh`:** the script greps function source for the URL pattern and asserts the SHA segment is 40 hex chars. No external API call to GitHub. Works offline; works in CI; works pre-deploy.
 
 ---
 
@@ -55,10 +59,10 @@ The 40-character hex string is the immutable commit SHA. This is enforced by `va
 
 To bump a utility:
 
-1. **Branch + edit + test** in the claimsco-utils repo. Run `deno test tests/<utilityName>.test.ts`.
+1. **Branch + edit + test** in the claimsco-utils repo. Run `deno test tests/integration.ts`.
 2. **PR + merge to main.** Merge commit SHA is the candidate new blessed SHA.
 3. **Update this document.** Move the previous Blessed SHA to the Change log section. Set the new SHA as Blessed.
-4. **Deploy consuming functions one at a time.** Each consuming function's import URL updates to the new SHA. Run `validate-imports.sh` before each deploy.
+4. **Deploy consuming functions one at a time.** Each consuming function's import URL updates to the new SHA.
 5. **Audit post-deploy.** Spot-check function execution logs to confirm new utility version executes as expected. If regression, revert by re-deploying the function with the previous SHA.
 
 The previous SHA remains immutably accessible — rollback is just re-deploy with the old import URL.
@@ -74,30 +78,31 @@ The previous SHA remains immutably accessible — rollback is just re-deploy wit
 **Signature:**
 
 ```typescript
-export async function mergeUpdate<T>(
+export async function mergeUpdate(
   entity: any,
   id: string,
-  patch: Partial<T>,
+  patch: Partial,
   options?: {
     verifyWrite?: boolean;     // default false
     maxRetries?: number;        // default 3
     reMergeOnRetry?: boolean;   // default true
     strictCompare?: boolean;    // default false (patch-only compare)
+    retryDelayMs?: number;      // default 100
   }
-): Promise<{ success: boolean; finalState: T }>;
+): Promise;
 ```
 
-**Behavior summary:** Reads current entity state, deep-merges the patch into it, writes the merged result. Default behavior fires-and-trusts. With `verifyWrite: true`, re-reads after the write and compares the patched fields against expected values; on mismatch, retries up to `maxRetries` times. On final mismatch returns `{ success: false }` so the caller can escalate (e.g., write `error_type: 'silent_discard'` to ErrorLog).
+**Behavior summary:** Reads current entity state, deep-merges the patch into it, writes the merged result. Default behavior fires-and-trusts. With `verifyWrite: true`, re-reads after the write and compares the patched fields against expected values; on mismatch, retries up to `maxRetries` times. On final mismatch returns `{ success: false, failureReason: 'silent_discard' }` so the caller can escalate (e.g., write `error_type: 'silent_discard'` to ErrorLog).
 
-Deep-merge replaces arrays wholesale by default. For appending to array fields (e.g., `activity_log`), use the `appendArrayField` utility instead.
+Deep-merge replaces arrays wholesale by default. For appending to array fields (e.g., `activity_log`), use `appendArrayField` instead.
 
 **Use case:** Standard updates to entities. Set `verifyWrite: true` for fields known to be contention-prone (e.g., `Claim.activity_log` accessed by multiple triggers, `Interaction.ai_analyzed_at` set by analyze-and-embed handler). Default-false on most calls keeps the read overhead off the hot path.
 
-**Blessed SHA:** TBD (pending File 3 commit)
+**Blessed SHA:** `368a2e2c5779a04a74cac33c7c09539c918ead97`
 
 **Consuming functions:** (none yet — populated as Phase 1+ functions adopt)
 
-**Change log:** (none yet)
+**Change log:** Initial blessed SHA committed 2026-04-27.
 
 ---
 
@@ -108,8 +113,8 @@ Deep-merge replaces arrays wholesale by default. For appending to array fields (
 **Signature:**
 
 ```typescript
-export async function withRetry<T>(
-  fn: () => Promise<T>,
+export async function withRetry(
+  fn: () => Promise,
   options?: {
     maxRetries?: number;                        // default 3
     baseDelayMs?: number;                       // default 250
@@ -117,21 +122,22 @@ export async function withRetry<T>(
     jitter?: boolean;                           // default true
     retryOn?: (err: any) => boolean;            // default: 5xx, network, 429
     deadlineAt?: number;                        // optional Date.now()-ms deadline
+    onRetry?: (info: { attempt; error; delayMs }) => void; // optional observability hook
   }
-): Promise<T>;
+): Promise;
 ```
 
 **Behavior summary:** Calls `fn()`. On failure that matches `retryOn`, waits with exponential backoff `min(baseDelayMs × 2^attempt, maxDelayMs)` (multiplied by random factor 0.5–1.5 if `jitter: true`) and retries up to `maxRetries` times. Default `retryOn` retries on HTTP 5xx, network errors, and 429 rate-limit responses. Does NOT retry 4xx (other than 429), invalid input, or assertion errors.
 
-**Deadline awareness:** if `deadlineAt` is provided, the next backoff sleep is capped so it doesn't exceed the deadline. If a retry would exceed the deadline, throws the last error immediately rather than burning the function's 30s budget on a sleep that runs out the clock. Recommend setting `deadlineAt: Date.now() + 25_000` for inline calls (5s buffer) and using PendingJob retry instead for longer work.
+**Deadline awareness:** if `deadlineAt` is provided, the next backoff sleep is capped so it doesn't exceed the deadline. If a retry would exceed the deadline, throws the last error immediately rather than burning the function's 30s budget on a sleep that runs out the clock. Recommended: `deadlineAt: Date.now() + 25_000` for inline calls (5s buffer); use PendingJob retry for longer work.
 
 **Use case:** Wrap every outbound HTTPS call (Anthropic, NOAA, Voyage, Gmail API). Wrap entity-API calls that may hit transient platform 502s. Do not wrap dispatcher-internal logic (the dispatcher has its own retry policy).
 
-**Blessed SHA:** TBD (pending File 4 commit)
+**Blessed SHA:** `204b58f605d73e28bac7d14b2997c87ed02e8b19`
 
 **Consuming functions:** (none yet)
 
-**Change log:** (none yet)
+**Change log:** Initial blessed SHA committed 2026-04-27.
 
 ---
 
@@ -151,23 +157,25 @@ export async function audit(
     target_id: string;
     before: any;                 // pre-state
     after: any;                  // post-state
-    metadata?: Record<string, any>;
+    metadata?: Record;
     occurred_at?: string;        // ISO 8601 UTC; defaults to now()
   }
-): Promise<{ id: string }>;
+): Promise;
 ```
 
-**Behavior summary:** Creates an `AuditLog` record. Uses verify-write semantics (per URGENT 15) — audit trail integrity is load-bearing for regulatory compliance, so silent discard is unacceptable here. If `before+after` JSON-stringified together exceeds 15KB, the utility uploads the full state to Base44 CDN and stores summary + URL on the AuditLog record (per URGENT 13's split-or-externalize pattern).
+**Behavior summary:** Creates an `AuditLog` record. Uses verify-write semantics (per URGENT 15) — audit trail integrity is load-bearing for regulatory compliance, so silent discard is unacceptable. If `before+after` JSON-stringified together exceeds 15KB, the utility uploads the full state to Base44 CDN via `Core.UploadFile` and stores summary + URL on the AuditLog record (per URGENT 13's split-or-externalize pattern, with a 14.5KB summary cap to leave headroom under the 20KB platform limit).
 
 `actor_email` is application-populated. Platform-stamped `created_by` is unreliable across entity types (per Phase 0 finding) and may surface as a service-account UUID; the AuditLog spec treats `actor_email` as the authoritative identity field.
 
+**Verify-write retry semantics:** AuditLog is append-only (`update`/`delete` blocked by `role: "never"`), so retry creates a NEW row rather than patching a lost write. Trade-off: duplicate AuditLog entries possible on retry. Acceptable — duplicates can be deduplicated downstream (P1-9 nightly consistency check); missing entries cannot be recreated.
+
 **Use case:** Every state-changing handler in Phase 1+ writes an AuditLog entry: claim status transitions, LOR signing, contractor invitations, dispute round changes, financial adjustments, role changes, document uploads. Reads do not audit unless they're sensitive (e.g., admin viewing financial fields).
 
-**Blessed SHA:** TBD (pending File 5 commit)
+**Blessed SHA:** `331e524197d5ca95825a936b253f4f9378a85281`
 
 **Consuming functions:** (none yet)
 
-**Change log:** (none yet)
+**Change log:** Initial blessed SHA committed 2026-04-27.
 
 ---
 
@@ -184,23 +192,55 @@ export function idempotencyGuard(
 ): { shouldSkip: boolean; reason?: string };
 ```
 
-**Behavior summary:** Inspects `record[processedAtField]`. If non-null, returns `{ shouldSkip: true, reason: 'already_processed' }`. Otherwise returns `{ shouldSkip: false }`. Pure function — does not call the entity API.
+**Behavior summary:** Inspects `record[processedAtField]`. If non-null, non-undefined, non-empty-string, returns `{ shouldSkip: true, reason: 'already_processed (...)' }`. Otherwise returns `{ shouldSkip: false }`. Pure function — no I/O, no side effects.
 
 **Use case:** First check inside any PendingJob handler or trigger handler. After loading the record by ID, run the guard and return 200 immediately if it says skip. Per URGENT 14, triggers may fire 7+ times on transient failure; combined with PendingJob heartbeat retries, a handler may invoke 10+ times for the same logical event. The guard is the load-bearing correctness mechanism that makes those re-invocations safe.
 
-Distinct from the dispatcher's `dispatcher_claim_id` optimistic-locking pattern. The dispatcher pattern claims a job for processing; this utility is for handlers checking whether the work itself is already done.
+Distinct from the dispatcher's `dispatcher_claim_id` optimistic-locking pattern (which prevents two dispatchers from picking up the same job). This utility is for handlers checking whether the work itself has already been done.
 
-**Blessed SHA:** TBD (pending File 6 commit)
+**Blessed SHA:** `55a44811f254738ff1491fc6a3226ceb5703a9ba`
 
 **Consuming functions:** (none yet)
 
-**Change log:** (none yet)
+**Change log:** Initial blessed SHA committed 2026-04-27.
 
 ---
 
-## Utilities pending strategy thread decision
+### `appendArrayField`
 
-`appendArrayField` — a small utility for appending entries to array-typed fields with proper read-spread-write-and-URGENT-15-verify semantics, plus URGENT 13 per-string-value size guards. Pending strategy thread direction in the App Thread Choice 1 review. If approved, will ship as `src/appendArrayField.ts` and get its own section above.
+**Source:** `src/appendArrayField.ts`
+
+**Signature:**
+
+```typescript
+export async function appendArrayField(
+  entity: any,
+  id: string,
+  fieldName: string,
+  newEntries: T[],
+  options?: {
+    verifyWrite?: boolean;            // default true (audit safety)
+    maxRetries?: number;              // default 3
+    preflightSizeCheck?: boolean;     // default true (URGENT 13)
+    maxStringValueBytes?: number;     // default 20000
+    retryDelayMs?: number;            // default 100
+  }
+): Promise;
+```
+
+**Behavior summary:** Reads entity, validates `entity[fieldName]` is an array (throws if not), preflight-scans each new entry for any string value exceeding `maxStringValueBytes` (rejects oversized entries individually rather than failing the whole batch), concatenates accepted entries onto the existing array, writes via `entity.update`. With `verifyWrite: true` (default), re-reads and confirms the array length increased by the expected count; retries on mismatch.
+
+**Verify-write retry semantics:** unlike `mergeUpdate`, retries do NOT re-merge. If actual length ≥ expected, treat as success (our entries — or equivalent count from a concurrent writer — are present). If actual length < expected, append accepted entries to current state and re-write. **Tolerant of concurrent appenders by design.** Does NOT guarantee exact entry order under contention.
+
+Returns `rejectedEntries` so callers can decide whether to externalize oversized content (e.g., upload to CDN, store URL) and re-attempt with smaller payloads.
+
+**Use case:** Any append to an array-typed entity field. Specifically: `Claim.activity_log` (audit trail), `Claim.interactions` (correspondence log), and any future array fields where appending is the access pattern. Code review rule: "Are you appending to an array entity field? Use `appendArrayField`."
+
+**Blessed SHA:** `97d7de098b9aedf2714b9e09594a6108804c7d19`
+
+**Consuming functions:** (none yet)
+
+**Change log:** Initial blessed SHA committed 2026-04-27.
 
 ---
 
@@ -217,13 +257,13 @@ Other utilities discovered during Phase 1 entity work will be added here followi
 To find all functions importing a specific utility version:
 
 ```bash
-grep -r "claimsco-utils/<SHA>/src/<utility>.ts" base44/functions/
+grep -r "claimsco-utils//src/.ts" base44/functions/
 ```
 
-To find any non-SHA-pinned imports:
+To find any utility imports across the codebase:
 
 ```bash
-bash scripts/validate-imports.sh
+grep -r "raw.githubusercontent.com/ClaimsCo/claimsco-utils" base44/functions/
 ```
 
 These commands provide audit answers without requiring runtime introspection of any deployed function.
