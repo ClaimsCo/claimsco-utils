@@ -30,6 +30,7 @@ When a utility is updated, the new SHA replaces the old in the Blessed SHA field
 | Visibility | Public (required for unauthenticated Deno URL imports) |
 | Sub-phase A empirical verification | ✅ Passed 2026-04-27 (mergeUpdate, withRetry, idempotencyGuard imported from blessed SHAs into a Base44 function; deploy + runtime tests all passed) |
 | Sub-phase C empirical verification | ✅ Passed 2026-04-27 (audit imported from blessed SHA into a Base44 function; inline + externalization E2E tests all passed against deployed AuditLog entity) |
+| Sub-phase D empirical verification | ✅ Passed 2026-04-28 — Three independent confirmations across hourlyErrorAlerting (D2), monthlyStorageCheck (D3), and renewGmailWatch (D1 investigation, since deleted). URL imports operationally proven across multiple scheduled-function contexts. |
 
 ---
 
@@ -143,7 +144,7 @@ export async function withRetry<T>(
 
 **Blessed SHA:** `204b58f605d73e28bac7d14b2997c87ed02e8b19`
 
-**Consuming functions:** (none yet)
+**Consuming functions:** `hourlyErrorAlerting` (D2 production), `monthlyStorageCheck` (D3 production)
 
 **Change log:** Initial blessed SHA committed 2026-04-27.
 
@@ -186,7 +187,7 @@ export async function audit(
 
 **Blessed SHA:** `7d4250d65f546f80f06784733d485a13d82ce7f4`
 
-**Consuming functions:** (none yet)
+**Consuming functions:** `hourlyErrorAlerting` (D2 production)
 
 **Change log:**
 - 2026-04-27 (commit `7d4250d65f546f80f06784733d485a13d82ce7f4`): Hygiene revision — added `is_test?: boolean` parameter to audit options for test-scaffolding filter support; default false matches prior production behavior. JSDoc enhanced with CDN public-access concern note and read-replica-lag context. Previous SHA: `331e524197d5ca95825a936b253f4f9378a85281`.
@@ -264,11 +265,62 @@ Returns `rejectedEntries` so callers can decide whether to externalize oversized
 
 ---
 
-## Future utilities (added in subsequent sub-phases)
+### `anthropic-client`
 
-`anthropic-client` (Sub-phase D Item D4) — singleton wrapping `npm:@anthropic-ai/sdk` with `withRetry` + LLMCache + LLMUsage logging.
+**Source:** `src/anthropic-client.ts`
 
-Other utilities discovered during Phase 1 entity work will be added here following the same pattern.
+**Signature:**
+
+```typescript
+export async function callAnthropic(
+  base44: any,
+  params: {
+    model: string;
+    messages: Array<{ role: 'user' | 'assistant'; content: string }>;
+    system?: string;
+    maxTokens?: number;          // default 4096
+    temperature?: number;         // default 0.0
+    functionName: string;          // required for usage tracking
+    claimId?: string | null;
+    interactionId?: string | null;
+    useCache?: boolean;            // default true if temperature ≤ 0.1
+    cacheTtlHours?: number;        // default 24
+    deadlineMs?: number;           // default 25_000
+  }
+): Promise<{
+  text: string;
+  usage: { input_tokens: number; output_tokens: number };
+  cacheHit: boolean;
+  model: string;
+  cachedAt?: string;
+}>;
+```
+
+**Behavior summary:** Singleton wrapper for the Anthropic SDK with three cross-cutting concerns built in:
+
+1. **withRetry** for transient API failures (5xx, 429, network errors). 401/403/400/404 are not retried.
+2. **LLMCache** for response caching, keyed by SHA-256 of (model + messages + system + maxTokens + temperature). Deterministic — same inputs produce same key. Inline-cached when response ≤14.5KB; CDN-externalized for larger responses (matches audit() pattern).
+3. **LLMUsage** for cost/token tracking on every call. Records `function_name`, `model`, tokens, estimated cost, claim/interaction IDs, and cache_hit flag. Fire-and-forget; failures don't break the API call.
+
+`functionName` is required so usage records can attribute cost back to the calling handler. `claimId` and `interactionId` are optional but recommended for per-claim cost analysis.
+
+**Caching semantics:**
+- `useCache` defaults to true when `temperature ≤ 0.1` (deterministic enough). Set explicitly to override.
+- `cacheTtlHours` defaults to 24h. Use higher values (168h = 7 days) for stable classification tasks; lower for time-sensitive content.
+- Cache lookup respects `expires_at` strictly — expired entries are misses, not hits.
+- On cache hit, the function still records LLMUsage with `cache_hit: true` so downstream cost-by-function reporting reflects cache effectiveness.
+
+**Cost estimation:** based on per-model rates encoded in the utility (Opus 4.7/4.6, Sonnet 4/4.6, Haiku 4.5). Update rates as Anthropic pricing changes via SHA bump. Unknown models fall back to Sonnet pricing.
+
+**Use case:** Every Anthropic API call from any Phase 1+ handler. Replaces direct `npm:@anthropic-ai/sdk` import patterns. Functions get retry + caching + usage logging without writing any of that logic themselves.
+
+**Required env:** `ANTHROPIC_API_KEY` set in Base44 secrets. Throws on first call if not set.
+
+**Blessed SHA:** `9100678a7625f1d26839d5c08550fb057418150f`
+
+**Consuming functions:** (none yet — populated as Phase 1+ handlers adopt)
+
+**Change log:** Initial blessed SHA committed 2026-04-28 (commit `9100678a7625f1d26839d5c08550fb057418150f`).
 
 ---
 
@@ -284,11 +336,19 @@ Empirical findings on Base44's entity filter API behavior. Useful for utility au
 | `$or` | Supported | Phase 0 | RLS rules with multiple identity branches |
 | `$regex` | Supported | Phase 0 | RLS email-pattern matching, text-search filters |
 | `$lt` | Supported | Phase 1 C2.3 | Cleanup tasks: `{ expires_at: { $lt: nowIso } }` |
-| `$gt` | Likely supported (untested) | — | Probable: `{ occurred_at: { $gt: oneHourAgoIso } }` |
-| `$gte` | Likely supported (untested) | — | Same family as `$lt` |
-| `$lte` | Likely supported (untested) | — | Same family as `$lt` |
+| `$gt` | Supported | Phase 1 D2 | `{ occurred_at: { $gt: oneHourAgoIso } }` |
+| `$gte` | Likely supported (untested) | — | Same family as `$lt`/`$gt` |
+| `$lte` | Likely supported (untested) | — | Same family as `$lt`/`$gt` |
 
 **Convention:** if you need an operator outside the empirically-confirmed set, validate it once in a small test against the relevant entity before depending on it in production code. The MongoDB-style operator family is the platform's pattern but not all operators have been individually confirmed.
+
+### Nested-key filtering
+
+| Pattern | Status | First confirmed | Use case |
+|---|---|---|---|
+| `{ 'metadata.field_name': value }` | Supported | Phase 1 D2 | Filter AuditLog by `metadata.function_name`, etc. |
+
+Useful for any entity using a structured `metadata` object field. First confirmed on AuditLog; likely generalizes.
 
 ### Default limits
 
@@ -297,6 +357,26 @@ Empirical findings on Base44's entity filter API behavior. Useful for utility au
 ### Comparison evaluation
 
 - `$lt` is strictly less-than. Boundary values (exactly equal to the comparison target) are NOT included. Mirrors MongoDB semantics.
+
+---
+
+## Storage usage API
+
+| Surface | Status | First tested | Notes |
+|---|---|---|---|
+| `asServiceRole.platform.getStorageUsage()` | Not available | Phase 1 D3 | Empirically confirmed missing from SDK. |
+| `asServiceRole.admin.getStorageUsage()` | Not available | Phase 1 D3 | Empirically confirmed missing from SDK. |
+| `asServiceRole.usage.get()` | Not available | Phase 1 D3 | Empirically confirmed missing from SDK. |
+
+**Implication:** programmatic storage monitoring is not currently possible via the Base44 SDK. monthlyStorageCheck (D3) handles this via graceful fallback to manual-check email reminder. Path A/C activation early-warning system operates with human-in-the-loop monthly review until Base44 ships a usage API.
+
+---
+
+## Deploy validator notes
+
+Base44's deploy validator treats every `Deno.env.get(...)` call as a declared secret dependency, even when the code provides a default fallback (`Deno.env.get('X') || 'default'`). Functions deploying with optional env config must explicitly register all such vars in Base44's secrets, OR avoid `Deno.env.get` for optional values (use constants or entity-based config instead).
+
+Confirmed empirically across Phase 1 D2 (`hourlyErrorAlerting`) and D3 (`monthlyStorageCheck`).
 
 ---
 
